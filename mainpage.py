@@ -1,28 +1,9 @@
 import streamlit as st
-from dotenv import load_dotenv
-import os
+from chat_fn import get_chat_preview, load_chat_history, create_new_chat, save_message, db
 from datetime import datetime
-from pymongo import MongoClient
-from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace
+from ai import ini_model
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-
-# Load environment variables
-load_dotenv()
-
-# MongoDB setup
-MONGODB_URI = os.getenv('MONGO_URI')
-if not MONGODB_URI:
-    st.error("Please set up the MONGODB_URI in your .env file")
-    st.stop()
-
-@st.cache_resource
-def init_mongodb():
-    client = MongoClient(MONGODB_URI)
-    db = client['chatbot_db']
-    return db
-
-# Initialize MongoDB
-db = init_mongodb()
+from initialization import init_session_state
 
 # Page config
 st.set_page_config(
@@ -31,40 +12,8 @@ st.set_page_config(
     layout="wide"  # Changed to wide layout
 )
 
-# Function to get chat preview
-def get_chat_preview(session_id):
-    chat_collection = db['chat_history']
-    first_message = chat_collection.find_one({"session_id": session_id}, sort=[("timestamp", 1)])
-    return first_message['content'][:30] + "..." if first_message else "Empty chat"
-
-# Function to load chat history
-def load_chat_history(session_id):
-    chat_collection = db['chat_history']
-    return list(chat_collection.find({"session_id": session_id}).sort("timestamp", 1))
-
-# Function to initialize session state
-def init_session_state():
-    if "chat_sessions" not in st.session_state:
-        st.session_state.chat_sessions = []
-    if "messages" not in st.session_state:
-        st.session_state.messages = [SystemMessage(content="You are a helpful assistant")]
-    if "session_id" not in st.session_state:
-        st.session_state.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        if st.session_state.session_id not in st.session_state.chat_sessions:
-            st.session_state.chat_sessions.append(st.session_state.session_id)
-
 # Initialize session state
 init_session_state()
-
-# Function to reset chat state
-def create_new_chat():
-    new_session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if "chat_sessions" not in st.session_state:
-        st.session_state.chat_sessions = []
-    if new_session_id not in st.session_state.chat_sessions:
-        st.session_state.chat_sessions.append(new_session_id)
-    st.session_state.session_id = new_session_id
-    st.session_state.messages = [SystemMessage(content="You are a helpful assistant")]
 
 # Sidebar for chat history
 with st.sidebar:
@@ -77,16 +26,21 @@ with st.sidebar:
 
     # Display chat history
     st.write("Previous Chats:")
-    chat_collection = db['chat_history']
-    unique_sessions = chat_collection.distinct("session_id")
+    # Get all chat sessions from all collections
+    all_sessions = set()
+    collections = [col for col in db.list_collection_names() if col.startswith('chat_history_')]
+    for collection_name in collections:
+        collection = db[collection_name]
+        collection_sessions = collection.distinct("session_id")
+        all_sessions.update(collection_sessions)
     
     # Update session list
-    for session in unique_sessions:
+    for session in all_sessions:
         if session not in st.session_state.chat_sessions:
             st.session_state.chat_sessions.append(session)
     
     # Display chat sessions
-    for session in reversed(st.session_state.chat_sessions):  # Show newest first
+    for session in reversed(sorted(st.session_state.chat_sessions)):  # Show newest first
         if st.button(f"📝 {datetime.strptime(session, '%Y%m%d_%H%M%S').strftime('%Y-%m-%d %H:%M')}\n{get_chat_preview(session)}", key=session):
             st.session_state.session_id = session
             # Load messages for the selected session
@@ -115,15 +69,7 @@ if "messages" not in st.session_state:
         st.session_state.messages = [SystemMessage(content="You are a helpful assistant")]
 
 # Initialize the model
-@st.cache_resource
-def initialize_model():
-    llm = HuggingFaceEndpoint(
-        repo_id="deepseek-ai/DeepSeek-V3.1",
-        task="text-generation",
-    )
-    return ChatHuggingFace(llm=llm, temp=0.7)
-
-model = initialize_model()
+model = ini_model()
 
 # Main chat area
 main_col = st.container()
@@ -151,14 +97,8 @@ with main_col:
 
 # Chat input
 if prompt := st.chat_input("What would you like to know?"):
-    # Store user message in MongoDB
-    chat_collection = db['chat_history']
-    chat_collection.insert_one({
-        "session_id": st.session_state.session_id,
-        "role": "user",
-        "content": prompt,
-        "timestamp": datetime.now()
-    })
+    # Save user message
+    save_message("user", prompt, st.session_state.session_id)
     
     # Add user message to session state
     st.session_state.messages.append(HumanMessage(content=prompt))
@@ -173,13 +113,8 @@ if prompt := st.chat_input("What would you like to know?"):
             response = model.invoke(st.session_state.messages)
             st.write(response.content)
     
-    # Store AI response in MongoDB
-    chat_collection.insert_one({
-        "session_id": st.session_state.session_id,
-        "role": "assistant",
-        "content": response.content,
-        "timestamp": datetime.now()
-    })
+    # Save AI response
+    save_message("assistant", response.content, st.session_state.session_id)
     
     # Add AI response to session state
     st.session_state.messages.append(AIMessage(content=response.content))
